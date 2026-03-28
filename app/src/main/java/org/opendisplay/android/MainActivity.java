@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
     private static final String TAG = "MainActivity";
     private static final long NO_SERVER_ICON_DELAY_MS = 5 * 60 * 1000;
     private static final long WHITE_FLASH_MS = 500;
-    private static final long RECONNECT_DELAY_MS = 1000;
+    private static final long RECONNECT_DELAY_MS = 2000;
     private static final long DISCOVERY_RETRY_DELAY_MS = 5000;
 
     private enum State { DISCOVERING, CONNECTING, CONNECTED, DISCONNECTED }
@@ -43,6 +43,7 @@ public class MainActivity extends Activity {
     private DisplayConfig displayConfig;
     private MdnsDiscovery discovery;
     private OpenDisplayClient client;
+    private int connectionGen;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private WifiManager.MulticastLock multicastLock;
@@ -116,6 +117,7 @@ public class MainActivity extends Activity {
 
         switch (newState) {
             case DISCOVERING:
+            case DISCONNECTED:
                 if (!hasImage) {
                     showStatus("Discovering OpenDisplay server\u2026");
                 } else {
@@ -124,17 +126,9 @@ public class MainActivity extends Activity {
                 break;
 
             case CONNECTING:
-                cancelNoServerTimer();
-                hideDisconnectIcon();
-                break;
-
             case CONNECTED:
                 cancelNoServerTimer();
                 hideDisconnectIcon();
-                break;
-
-            case DISCONNECTED:
-                scheduleReconnect();
                 break;
         }
     }
@@ -171,11 +165,7 @@ public class MainActivity extends Activity {
                     handler.postDelayed(new Runnable() {
                         @Override
                         public void run() {
-                            if (!isFinishing()) {
-                                discovery.stop();
-                                discovery = new MdnsDiscovery(MainActivity.this, discoveryListener);
-                                discovery.start();
-                            }
+                            if (!isFinishing()) discovery.start();
                         }
                     }, DISCOVERY_RETRY_DELAY_MS);
                 }
@@ -198,7 +188,6 @@ public class MainActivity extends Activity {
 
         if (!name.equals(activeServiceName)) return;
 
-        // If we have an active TCP connection, let it run until it naturally dies.
         if (state == State.CONNECTED || state == State.CONNECTING) {
             Log.i(TAG, "Active server left mDNS, keeping TCP connection");
             return;
@@ -228,6 +217,7 @@ public class MainActivity extends Activity {
         if (ep == null) return;
 
         activeServiceName = name;
+        final int gen = ++connectionGen;
         enterState(State.CONNECTING);
 
         if (!hasImage) {
@@ -236,7 +226,64 @@ public class MainActivity extends Activity {
 
         Log.i(TAG, "Connecting to " + ep.host + ":" + ep.port);
 
-        final OpenDisplayClient newClient = new OpenDisplayClient(displayConfig, clientListener);
+        final OpenDisplayClient newClient = new OpenDisplayClient(
+            displayConfig, new OpenDisplayClient.Listener() {
+                @Override
+                public void onConnected(final String h, final int p) {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (gen != connectionGen) return;
+                            Log.i(TAG, "Connected to " + h + ":" + p);
+                            enterState(State.CONNECTED);
+                        }
+                    });
+                }
+
+                @Override
+                public void onDisconnected(final String reason) {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (gen != connectionGen) return;
+                            Log.i(TAG, "Disconnected: " + reason);
+                            client = null;
+                            activeServiceName = null;
+
+                            if (!connectToNextServer()) {
+                                enterState(State.DISCONNECTED);
+                                scheduleReconnect();
+                            }
+                        }
+                    });
+                }
+
+                @Override
+                public void onImageReceived(final byte[] data, final int refreshType,
+                        final long poll) {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (gen != connectionGen) return;
+                            renderImage(data);
+                        }
+                    });
+                }
+
+                @Override
+                public void onNoImage(long poll) {}
+
+                @Override
+                public void onError(final String message) {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (gen != connectionGen) return;
+                            Log.e(TAG, "Client error: " + message);
+                        }
+                    });
+                }
+            });
         client = newClient;
 
         try {
@@ -250,66 +297,6 @@ public class MainActivity extends Activity {
         newClient.start(ep.host, ep.port);
     }
 
-    private final OpenDisplayClient.Listener clientListener = new OpenDisplayClient.Listener() {
-        @Override
-        public void onConnected(final String h, final int p) {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    Log.i(TAG, "Connected to " + h + ":" + p);
-                    enterState(State.CONNECTED);
-                }
-            });
-        }
-
-        @Override
-        public void onDisconnected(final String reason) {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    Log.i(TAG, "Disconnected: " + reason);
-                    client = null;
-
-                    // Remove the server that just failed from the pool.
-                    if (activeServiceName != null) {
-                        servers.remove(activeServiceName);
-                        activeServiceName = null;
-                    }
-
-                    // Try another known server, else wait for discovery.
-                    if (!connectToNextServer()) {
-                        enterState(State.DISCONNECTED);
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void onImageReceived(final byte[] data, final int refreshType, final long poll) {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    renderImage(data);
-                }
-            });
-        }
-
-        @Override
-        public void onNoImage(final long poll) {
-            // Nothing to do on UI thread.
-        }
-
-        @Override
-        public void onError(final String message) {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    Log.e(TAG, "Client error: " + message);
-                }
-            });
-        }
-    };
-
     private void stopClient() {
         if (client != null) {
             client.stop();
@@ -319,27 +306,20 @@ public class MainActivity extends Activity {
 
     // -- Reconnect scheduling --
 
+    /**
+     * Schedules a single reconnect attempt after a delay. Discovery is still
+     * running — if a new server appears, handleServerFound connects immediately
+     * and cancels this. This handles the case where all known servers are still
+     * in the map but had transient TCP failures.
+     */
     private void scheduleReconnect() {
         cancelScheduledReconnect();
-
-        if (!hasImage) {
-            showStatus("Discovering OpenDisplay server\u2026");
-        } else {
-            scheduleNoServerIcon();
-        }
-
-        // Discovery is still running. If a new server appears, handleServerFound
-        // will connect immediately. This runnable is a fallback to retry any
-        // servers that may have reappeared in the map by then.
         reconnectRunnable = new Runnable() {
             @Override
             public void run() {
                 reconnectRunnable = null;
                 if (!isFinishing() && state == State.DISCONNECTED) {
-                    if (!connectToNextServer()) {
-                        // Still nothing — keep waiting, discovery will trigger us.
-                        scheduleReconnect();
-                    }
+                    connectToNextServer();
                 }
             }
         };
