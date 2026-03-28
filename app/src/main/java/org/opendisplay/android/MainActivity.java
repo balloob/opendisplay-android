@@ -27,6 +27,7 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "MainActivity";
     private static final long NO_SERVER_ICON_DELAY_MS = 5 * 60 * 1000;
+    private static final long WHITE_FLASH_MS = 500;
 
     private ImageView imageDisplay;
     private TextView statusText;
@@ -220,9 +221,22 @@ public class MainActivity extends Activity {
             imageData, displayConfig.width, displayConfig.height, displayConfig.colorScheme);
 
         if (pixels != null) {
-            Bitmap bmp = Bitmap.createBitmap(
+            final Bitmap bmp = Bitmap.createBitmap(
                 pixels, displayConfig.width, displayConfig.height, Bitmap.Config.ARGB_8888);
-            imageDisplay.setImageBitmap(bmp);
+
+            if (hasImage) {
+                // Flash white first to clear e-ink ghosting
+                imageDisplay.setImageBitmap(null);
+                mainHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        imageDisplay.setImageBitmap(bmp);
+                    }
+                }, WHITE_FLASH_MS);
+            } else {
+                imageDisplay.setImageBitmap(bmp);
+            }
+
             hasImage = true;
             statusText.setVisibility(View.GONE);
             hideDisconnectIcon();
