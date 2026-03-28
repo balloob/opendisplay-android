@@ -28,31 +28,31 @@ import java.util.Map;
 public class MainActivity extends Activity {
 
     private static final String TAG = "MainActivity";
-    private static final long DISCOVERY_RESTART_DELAY_MS = 1000;
     private static final long NO_SERVER_ICON_DELAY_MS = 5 * 60 * 1000;
     private static final long WHITE_FLASH_MS = 500;
+    private static final long RECONNECT_DELAY_MS = 1000;
+    private static final long DISCOVERY_RETRY_DELAY_MS = 5000;
+
+    private enum State { DISCOVERING, CONNECTING, CONNECTED, DISCONNECTED }
 
     private ImageView imageDisplay;
     private TextView statusText;
     private ImageView disconnectIcon;
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private DisplayConfig displayConfig;
-    private OpenDisplayClient client;
     private MdnsDiscovery discovery;
+    private OpenDisplayClient client;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
-    private final Map<String, ServerEndpoint> discoveredServers =
-        new LinkedHashMap<String, ServerEndpoint>();
+    private WifiManager.MulticastLock multicastLock;
 
-    private boolean hasImage = false;
-    private boolean serverConnected = false;
-    private boolean connectionPending = false;
-    private Runnable noServerRunnable;
-    private Runnable discoveryRestartRunnable;
+    private final Map<String, ServerEndpoint> servers = new LinkedHashMap<>();
+    private State state = State.DISCOVERING;
     private String activeServiceName;
-    private String activeHost;
-    private int activePort = -1;
+    private boolean hasImage = false;
+    private Runnable noServerRunnable;
+    private Runnable reconnectRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -86,250 +86,302 @@ public class MainActivity extends Activity {
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL, "OpenDisplay:wifi");
         wifiLock.acquire();
 
+        multicastLock = wm.createMulticastLock("OpenDisplay:mdns");
+        multicastLock.acquire();
+
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        startDiscovery();
+        discovery = new MdnsDiscovery(this, discoveryListener);
+        discovery.start();
+        enterState(State.DISCOVERING);
     }
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
+        cancelScheduledReconnect();
         cancelNoServerTimer();
-        cancelDiscoveryRestart();
         stopClient();
-        if (discovery != null) discovery.stop();
+        discovery.stop();
         if (wakeLock.isHeld()) wakeLock.release();
         if (wifiLock.isHeld()) wifiLock.release();
+        if (multicastLock.isHeld()) multicastLock.release();
+        super.onDestroy();
     }
 
-    private void startDiscovery() {
-        cancelDiscoveryRestart();
-        Log.i(TAG, "Discovering OpenDisplay server…");
-        showDiscoveryState();
+    // -- State machine --
 
-        if (discovery == null) {
-            discovery = new MdnsDiscovery(this, new MdnsDiscovery.Listener() {
-                @Override
-                public void onServerFound(
-                        final String serviceName, final InetAddress host, final int port) {
-                    mainHandler.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            handleServerFound(serviceName, host, port);
-                        }
-                    });
+    private void enterState(State newState) {
+        state = newState;
+        Log.i(TAG, "State → " + newState);
+
+        switch (newState) {
+            case DISCOVERING:
+                if (!hasImage) {
+                    showStatus("Discovering OpenDisplay server\u2026");
+                } else {
+                    scheduleNoServerIcon();
                 }
+                break;
 
-                @Override
-                public void onServerLost(final String serviceName) {
-                    mainHandler.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            handleServerLost(serviceName);
-                        }
-                    });
-                }
+            case CONNECTING:
+                cancelNoServerTimer();
+                hideDisconnectIcon();
+                break;
 
+            case CONNECTED:
+                cancelNoServerTimer();
+                hideDisconnectIcon();
+                break;
+
+            case DISCONNECTED:
+                scheduleReconnect();
+                break;
+        }
+    }
+
+    // -- Discovery callbacks (may arrive on NSD threads) --
+
+    private final MdnsDiscovery.Listener discoveryListener = new MdnsDiscovery.Listener() {
+        @Override
+        public void onServerFound(final String name, final InetAddress host, final int port) {
+            handler.post(new Runnable() {
                 @Override
-                public void onDiscoveryError(final String message) {
-                    mainHandler.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            Log.e(TAG, "Discovery error: " + message);
-                        }
-                    });
+                public void run() {
+                    handleServerFound(name, host.getHostAddress(), port);
                 }
             });
         }
-        discovery.start();
+
+        @Override
+        public void onServerLost(final String name) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    handleServerLost(name);
+                }
+            });
+        }
+
+        @Override
+        public void onDiscoveryStartFailed(final int errorCode) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    Log.e(TAG, "Discovery start failed: " + errorCode + ", retrying");
+                    handler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!isFinishing()) {
+                                discovery.stop();
+                                discovery = new MdnsDiscovery(MainActivity.this, discoveryListener);
+                                discovery.start();
+                            }
+                        }
+                    }, DISCOVERY_RETRY_DELAY_MS);
+                }
+            });
+        }
+    };
+
+    private void handleServerFound(String name, String host, int port) {
+        servers.put(name, new ServerEndpoint(host, port));
+        Log.i(TAG, "Server: " + name + " at " + host + ":" + port);
+
+        if (state == State.DISCOVERING || state == State.DISCONNECTED) {
+            connectToServer(name);
+        }
     }
 
-    private void handleServerFound(String serviceName, InetAddress host, int port) {
-        String hostAddress = host.getHostAddress();
-        discoveredServers.put(serviceName, new ServerEndpoint(hostAddress, port));
-        Log.i(TAG, "Server available: " + serviceName + " at " + hostAddress + ":" + port);
+    private void handleServerLost(String name) {
+        servers.remove(name);
+        Log.i(TAG, "Server gone: " + name);
 
-        if (isActiveServer(serviceName, hostAddress, port)) {
+        if (!name.equals(activeServiceName)) return;
+
+        // If we have an active TCP connection, let it run until it naturally dies.
+        if (state == State.CONNECTED || state == State.CONNECTING) {
+            Log.i(TAG, "Active server left mDNS, keeping TCP connection");
             return;
         }
 
-        if (activeServiceName == null && client == null && !connectionPending) {
-            connectToAvailableServer();
+        activeServiceName = null;
+        if (!connectToNextServer()) {
+            enterState(State.DISCOVERING);
         }
     }
 
-    private void handleServerLost(String serviceName) {
-        discoveredServers.remove(serviceName);
-        Log.i(TAG, "Server disappeared: " + serviceName);
+    // -- Connection --
 
-        if (!serviceName.equals(activeServiceName)) {
-            return;
-        }
-
-        if (client != null || connectionPending) {
-            Log.i(
-                TAG,
-                "Active server disappeared from mDNS, keeping current TCP connection until it closes"
-            );
-            return;
-        }
-
-        Log.i(TAG, "Current server disappeared, looking for another OpenDisplay server");
-        clearActiveServer();
-
-        if (!connectToAvailableServer()) {
-            showDiscoveryState();
-        }
-    }
-
-    private boolean connectToAvailableServer() {
-        if (activeServiceName != null || client != null || connectionPending) {
-            return false;
-        }
-
-        for (Map.Entry<String, ServerEndpoint> entry : discoveredServers.entrySet()) {
-            ServerEndpoint endpoint = entry.getValue();
-            connectToServer(entry.getKey(), endpoint.host, endpoint.port);
+    private boolean connectToNextServer() {
+        for (Map.Entry<String, ServerEndpoint> entry : servers.entrySet()) {
+            connectToServer(entry.getKey());
             return true;
         }
-
         return false;
     }
 
-    private void connectToServer(final String serviceName, final String host, final int port) {
-        cancelNoServerTimer();
-        cancelDiscoveryRestart();
-        hideDisconnectIcon();
-        Log.i(TAG, "Connecting to " + host + ":" + port);
-
+    private void connectToServer(String name) {
+        cancelScheduledReconnect();
         stopClient();
-        activeServiceName = serviceName;
-        activeHost = host;
-        activePort = port;
-        connectionPending = true;
-        serverConnected = false;
+
+        ServerEndpoint ep = servers.get(name);
+        if (ep == null) return;
+
+        activeServiceName = name;
+        enterState(State.CONNECTING);
 
         if (!hasImage) {
-            showStatus("Connecting to " + host + ":" + port);
+            showStatus("Connecting to " + ep.host + ":" + ep.port);
         }
 
-        final ClientRef clientRef = new ClientRef();
-        final OpenDisplayClient newClient = new OpenDisplayClient(
-            displayConfig, new OpenDisplayClient.Listener() {
-            @Override
-            public void onConnected(final String h, final int p) {
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (client != clientRef.client) return;
-                        connectionPending = false;
-                        serverConnected = true;
-                        cancelNoServerTimer();
-                        hideDisconnectIcon();
-                        Log.i(TAG, "Connected to " + h + ":" + p);
-                    }
-                });
-            }
+        Log.i(TAG, "Connecting to " + ep.host + ":" + ep.port);
 
-            @Override
-            public void onDisconnected(final String reason) {
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (client != clientRef.client) return;
-                        client = null;
-                        connectionPending = false;
-                        serverConnected = false;
-                        Log.i(TAG, "Disconnected: " + reason);
-
-                        if (activeServiceName != null) {
-                            discoveredServers.remove(activeServiceName);
-                        }
-                        clearActiveServer();
-
-                        if (!connectToAvailableServer()) {
-                            scheduleDiscoveryRestart();
-                        }
-                    }
-                });
-            }
-
-            @Override
-            public void onImageReceived(final byte[] imageData, final int refreshType, final long pollInterval) {
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (client != clientRef.client) return;
-                        renderImage(imageData);
-                    }
-                });
-            }
-
-            @Override
-            public void onNoImage(final long pollInterval) {
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (client != clientRef.client) return;
-                        Log.i(TAG, "No new image, polling in " + pollInterval + "s");
-                    }
-                });
-            }
-
-            @Override
-            public void onError(final String message) {
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (client != clientRef.client) return;
-                        Log.e(TAG, "Error: " + message);
-                    }
-                });
-            }
-        });
-        clientRef.client = newClient;
+        final OpenDisplayClient newClient = new OpenDisplayClient(displayConfig, clientListener);
         client = newClient;
 
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
             WifiInfo info = wm.getConnectionInfo();
-            if (info != null) {
-                newClient.setRssi(info.getRssi());
-            }
+            if (info != null) newClient.setRssi(info.getRssi());
         } catch (Exception e) {
             Log.w(TAG, "Could not get WiFi RSSI", e);
         }
 
-        newClient.start(host, port);
+        newClient.start(ep.host, ep.port);
     }
+
+    private final OpenDisplayClient.Listener clientListener = new OpenDisplayClient.Listener() {
+        @Override
+        public void onConnected(final String h, final int p) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    Log.i(TAG, "Connected to " + h + ":" + p);
+                    enterState(State.CONNECTED);
+                }
+            });
+        }
+
+        @Override
+        public void onDisconnected(final String reason) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    Log.i(TAG, "Disconnected: " + reason);
+                    client = null;
+
+                    // Remove the server that just failed from the pool.
+                    if (activeServiceName != null) {
+                        servers.remove(activeServiceName);
+                        activeServiceName = null;
+                    }
+
+                    // Try another known server, else wait for discovery.
+                    if (!connectToNextServer()) {
+                        enterState(State.DISCONNECTED);
+                    }
+                }
+            });
+        }
+
+        @Override
+        public void onImageReceived(final byte[] data, final int refreshType, final long poll) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    renderImage(data);
+                }
+            });
+        }
+
+        @Override
+        public void onNoImage(final long poll) {
+            // Nothing to do on UI thread.
+        }
+
+        @Override
+        public void onError(final String message) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    Log.e(TAG, "Client error: " + message);
+                }
+            });
+        }
+    };
+
+    private void stopClient() {
+        if (client != null) {
+            client.stop();
+            client = null;
+        }
+    }
+
+    // -- Reconnect scheduling --
+
+    private void scheduleReconnect() {
+        cancelScheduledReconnect();
+
+        if (!hasImage) {
+            showStatus("Discovering OpenDisplay server\u2026");
+        } else {
+            scheduleNoServerIcon();
+        }
+
+        // Discovery is still running. If a new server appears, handleServerFound
+        // will connect immediately. This runnable is a fallback to retry any
+        // servers that may have reappeared in the map by then.
+        reconnectRunnable = new Runnable() {
+            @Override
+            public void run() {
+                reconnectRunnable = null;
+                if (!isFinishing() && state == State.DISCONNECTED) {
+                    if (!connectToNextServer()) {
+                        // Still nothing — keep waiting, discovery will trigger us.
+                        scheduleReconnect();
+                    }
+                }
+            }
+        };
+        handler.postDelayed(reconnectRunnable, RECONNECT_DELAY_MS);
+    }
+
+    private void cancelScheduledReconnect() {
+        if (reconnectRunnable != null) {
+            handler.removeCallbacks(reconnectRunnable);
+            reconnectRunnable = null;
+        }
+    }
+
+    // -- UI helpers --
 
     private void renderImage(byte[] imageData) {
         int[] pixels = ImageDecoder.decode(
             imageData, displayConfig.width, displayConfig.height, displayConfig.colorScheme);
 
-        if (pixels != null) {
-            final Bitmap bmp = Bitmap.createBitmap(
-                pixels, displayConfig.width, displayConfig.height, Bitmap.Config.ARGB_8888);
-
-            if (hasImage) {
-                // Flash white first to clear e-ink ghosting
-                imageDisplay.setImageBitmap(null);
-                mainHandler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        imageDisplay.setImageBitmap(bmp);
-                    }
-                }, WHITE_FLASH_MS);
-            } else {
-                imageDisplay.setImageBitmap(bmp);
-            }
-
-            hasImage = true;
-            statusText.setVisibility(View.GONE);
-            hideDisconnectIcon();
-        } else {
+        if (pixels == null) {
             Log.w(TAG, "Failed to decode image (" + imageData.length + " bytes)");
+            return;
         }
+
+        final Bitmap bmp = Bitmap.createBitmap(
+            pixels, displayConfig.width, displayConfig.height, Bitmap.Config.ARGB_8888);
+
+        if (hasImage) {
+            imageDisplay.setImageBitmap(null);
+            handler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    imageDisplay.setImageBitmap(bmp);
+                }
+            }, WHITE_FLASH_MS);
+        } else {
+            imageDisplay.setImageBitmap(bmp);
+        }
+
+        hasImage = true;
+        statusText.setVisibility(View.GONE);
+        hideDisconnectIcon();
     }
 
     private void showStatus(String text) {
@@ -337,100 +389,26 @@ public class MainActivity extends Activity {
         statusText.setVisibility(View.VISIBLE);
     }
 
-    private void showDisconnectIcon() {
-        disconnectIcon.setVisibility(View.VISIBLE);
-    }
-
     private void hideDisconnectIcon() {
         disconnectIcon.setVisibility(View.GONE);
     }
 
-    private void showDiscoveryState() {
-        serverConnected = false;
-        connectionPending = false;
-
-        if (!hasImage) {
-            showStatus("Discovering OpenDisplay server…");
-        } else {
-            scheduleNoServerIcon();
-        }
-    }
-
-    private void stopClient() {
-        if (client == null) {
-            return;
-        }
-
-        OpenDisplayClient activeClient = client;
-        client = null;
-        activeClient.stop();
-    }
-
-    private void clearActiveServer() {
-        activeServiceName = null;
-        activeHost = null;
-        activePort = -1;
-    }
-
-    private void scheduleDiscoveryRestart() {
-        showDiscoveryState();
-
-        if (isFinishing()) {
-            return;
-        }
-
-        cancelDiscoveryRestart();
-        discoveredServers.clear();
-
-        if (discovery != null) {
-            discovery.stop();
-            discovery = null;
-        }
-
-        discoveryRestartRunnable = new Runnable() {
-            @Override
-            public void run() {
-                discoveryRestartRunnable = null;
-                if (!isFinishing()) {
-                    startDiscovery();
-                }
-            }
-        };
-        mainHandler.postDelayed(discoveryRestartRunnable, DISCOVERY_RESTART_DELAY_MS);
-    }
-
-    private void cancelDiscoveryRestart() {
-        if (discoveryRestartRunnable != null) {
-            mainHandler.removeCallbacks(discoveryRestartRunnable);
-            discoveryRestartRunnable = null;
-        }
-    }
-
-    private boolean isActiveServer(String serviceName, String host, int port) {
-        if (!serviceName.equals(activeServiceName) || activeHost == null) {
-            return false;
-        }
-
-        return activeHost.equals(host) && activePort == port;
-    }
-
-    /** After 5 minutes without a server, show disconnect icon. */
     private void scheduleNoServerIcon() {
         cancelNoServerTimer();
         noServerRunnable = new Runnable() {
             @Override
             public void run() {
-                if (!serverConnected && hasImage) {
-                    showDisconnectIcon();
+                if (state != State.CONNECTED && hasImage) {
+                    disconnectIcon.setVisibility(View.VISIBLE);
                 }
             }
         };
-        mainHandler.postDelayed(noServerRunnable, NO_SERVER_ICON_DELAY_MS);
+        handler.postDelayed(noServerRunnable, NO_SERVER_ICON_DELAY_MS);
     }
 
     private void cancelNoServerTimer() {
         if (noServerRunnable != null) {
-            mainHandler.removeCallbacks(noServerRunnable);
+            handler.removeCallbacks(noServerRunnable);
             noServerRunnable = null;
         }
     }
@@ -448,18 +426,13 @@ public class MainActivity extends Activity {
 
     private DisplayConfig buildDisplayConfig() {
         DisplayConfig cfg = new DisplayConfig();
-
         Display display = getWindowManager().getDefaultDisplay();
         Point size = new Point();
         display.getRealSize(size);
-
         cfg.width = Math.max(size.x, size.y);
         cfg.height = Math.min(size.x, size.y);
         cfg.colorScheme = OpenDisplayProtocol.COLOR_MONOCHROME;
-
-        Log.i(TAG, "Display config: " + cfg.width + "x" + cfg.height
-            + " scheme=" + cfg.colorScheme);
-
+        Log.i(TAG, "Display: " + cfg.width + "x" + cfg.height);
         return cfg;
     }
 
@@ -477,13 +450,5 @@ public class MainActivity extends Activity {
             this.host = host;
             this.port = port;
         }
-
-        boolean matches(String otherHost, int otherPort) {
-            return host.equals(otherHost) && port == otherPort;
-        }
-    }
-
-    private static class ClientRef {
-        OpenDisplayClient client;
     }
 }
