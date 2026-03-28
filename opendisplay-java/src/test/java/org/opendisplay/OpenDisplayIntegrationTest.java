@@ -37,8 +37,6 @@ public class OpenDisplayIntegrationTest {
             "--checkerboard",
             "--no-mdns",
             "--port", "0",
-            "--width", String.valueOf(TEST_WIDTH),
-            "--height", String.valueOf(TEST_HEIGHT),
             "--poll-interval", String.valueOf(POLL_INTERVAL),
             "-v"
         );

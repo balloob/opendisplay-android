@@ -120,6 +120,12 @@ public class MainActivity extends Activity {
         hideDisconnectIcon();
         Log.i(TAG, "Connecting to " + host + ":" + port);
 
+        // Stop any existing client before creating a new one
+        if (client != null) {
+            client.stop();
+            client = null;
+        }
+
         if (!hasImage) {
             showStatus("Connecting to " + host + ":" + port);
         }

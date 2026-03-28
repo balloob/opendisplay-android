@@ -81,6 +81,7 @@ public class OpenDisplayClient {
     public boolean isRunning() { return running; }
 
     private void communicate(String host, int port) {
+        String disconnectReason = "Connection closed";
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
@@ -91,16 +92,14 @@ public class OpenDisplayClient {
             OutputStream out = socket.getOutputStream();
 
             while (running) {
-                // Send image request
                 byte[] request = OpenDisplayProtocol.buildImageRequest(batteryPercent, rssi);
                 LOG.fine("Sending image request");
                 out.write(request);
                 out.flush();
 
-                // Read response
                 byte[] frame = readFrame(in);
                 if (frame == null) {
-                    listener.onDisconnected("Failed to read frame");
+                    disconnectReason = "Failed to read frame";
                     break;
                 }
 
@@ -108,7 +107,7 @@ public class OpenDisplayClient {
                     OpenDisplayProtocol.parseFrame(frame, frame.length);
 
                 if (resp == null) {
-                    listener.onDisconnected("Invalid frame received");
+                    disconnectReason = "Invalid frame received";
                     break;
                 }
 
@@ -139,10 +138,10 @@ public class OpenDisplayClient {
                 }
             }
         } catch (InterruptedException e) {
-            // Normal shutdown
+            disconnectReason = "Interrupted";
         } catch (Exception e) {
             LOG.log(Level.WARNING, "Client error", e);
-            listener.onError(e.getMessage());
+            disconnectReason = e.getMessage();
         } finally {
             try {
                 socket.close();
@@ -150,7 +149,7 @@ public class OpenDisplayClient {
                 // ignore
             }
             running = false;
-            listener.onDisconnected("Connection closed");
+            listener.onDisconnected(disconnectReason);
         }
     }
 
