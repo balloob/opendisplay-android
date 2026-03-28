@@ -40,6 +40,7 @@ public class OpenDisplayClient {
 
     private volatile boolean running = false;
     private Thread clientThread;
+    private final Object sleepLock = new Object();
 
     public OpenDisplayClient(DisplayConfig config, Listener listener) {
         this.config = config;
@@ -66,6 +67,9 @@ public class OpenDisplayClient {
     /** Stops the client and closes the connection. */
     public void stop() {
         running = false;
+        synchronized (sleepLock) {
+            sleepLock.notifyAll();
+        }
         if (clientThread != null) {
             clientThread.interrupt();
         }
@@ -190,11 +194,9 @@ public class OpenDisplayClient {
     private void sleepSeconds(long seconds) throws InterruptedException {
         if (seconds <= 0) return;
         long ms = seconds * 1000;
-        long deadline = System.currentTimeMillis() + ms;
-        while (running && System.currentTimeMillis() < deadline) {
-            long remaining = deadline - System.currentTimeMillis();
-            if (remaining > 0) {
-                Thread.sleep(Math.min(remaining, 1000));
+        synchronized (sleepLock) {
+            if (running) {
+                sleepLock.wait(ms);
             }
         }
     }

@@ -102,14 +102,24 @@ public class MainActivity extends Activity {
 
         discovery = new MdnsDiscovery(this, new MdnsDiscovery.Listener() {
             @Override
-            public void onServerFound(InetAddress host, int port) {
-                discovery.stop();
-                connectToServer(host.getHostAddress(), port);
+            public void onServerFound(final InetAddress host, final int port) {
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        discovery.stop();
+                        connectToServer(host.getHostAddress(), port);
+                    }
+                });
             }
 
             @Override
-            public void onDiscoveryError(String message) {
-                Log.e(TAG, "Discovery error: " + message);
+            public void onDiscoveryError(final String message) {
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Log.e(TAG, "Discovery error: " + message);
+                    }
+                });
             }
         });
         discovery.start();
@@ -132,32 +142,37 @@ public class MainActivity extends Activity {
 
         client = new OpenDisplayClient(displayConfig, new OpenDisplayClient.Listener() {
             @Override
-            public void onConnected(String h, int p) {
-                serverConnected = true;
-                cancelNoServerTimer();
+            public void onConnected(final String h, final int p) {
                 mainHandler.post(new Runnable() {
                     @Override
                     public void run() {
+                        serverConnected = true;
+                        cancelNoServerTimer();
                         hideDisconnectIcon();
+                        Log.i(TAG, "Connected to " + h + ":" + p);
                     }
                 });
-                Log.i(TAG, "Connected to " + h + ":" + p);
             }
 
             @Override
-            public void onDisconnected(String reason) {
-                serverConnected = false;
-                Log.i(TAG, "Disconnected: " + reason);
-                mainHandler.postDelayed(new Runnable() {
+            public void onDisconnected(final String reason) {
+                mainHandler.post(new Runnable() {
                     @Override
                     public void run() {
-                        if (!isFinishing()) startDiscovery();
+                        serverConnected = false;
+                        Log.i(TAG, "Disconnected: " + reason);
+                        mainHandler.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (!isFinishing()) startDiscovery();
+                            }
+                        }, 5000);
                     }
-                }, 5000);
+                });
             }
 
             @Override
-            public void onImageReceived(final byte[] imageData, int refreshType, long pollInterval) {
+            public void onImageReceived(final byte[] imageData, final int refreshType, final long pollInterval) {
                 mainHandler.post(new Runnable() {
                     @Override
                     public void run() {
@@ -167,13 +182,23 @@ public class MainActivity extends Activity {
             }
 
             @Override
-            public void onNoImage(long pollInterval) {
-                Log.i(TAG, "No new image, polling in " + pollInterval + "s");
+            public void onNoImage(final long pollInterval) {
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Log.i(TAG, "No new image, polling in " + pollInterval + "s");
+                    }
+                });
             }
 
             @Override
-            public void onError(String message) {
-                Log.e(TAG, "Error: " + message);
+            public void onError(final String message) {
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Log.e(TAG, "Error: " + message);
+                    }
+                });
             }
         });
 
