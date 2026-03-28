@@ -26,10 +26,11 @@ import java.net.InetAddress;
 public class MainActivity extends Activity {
 
     private static final String TAG = "MainActivity";
-    private static final long NO_SERVER_STATUS_DELAY_MS = 5 * 60 * 1000;
+    private static final long NO_SERVER_ICON_DELAY_MS = 5 * 60 * 1000;
 
     private ImageView imageDisplay;
     private TextView statusText;
+    private ImageView disconnectIcon;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private DisplayConfig displayConfig;
@@ -40,7 +41,7 @@ public class MainActivity extends Activity {
 
     private boolean hasImage = false;
     private boolean serverConnected = false;
-    private Runnable noServerStatusRunnable;
+    private Runnable noServerRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,16 +50,16 @@ public class MainActivity extends Activity {
 
         imageDisplay = (ImageView) findViewById(R.id.image_display);
         statusText = (TextView) findViewById(R.id.status_text);
+        disconnectIcon = (ImageView) findViewById(R.id.disconnect_icon);
 
         hideSystemUI();
 
-        // Tap to toggle status overlay
         imageDisplay.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 if (statusText.getVisibility() == View.VISIBLE) {
                     statusText.setVisibility(View.GONE);
-                } else {
+                } else if (hasImage) {
                     statusText.setVisibility(View.VISIBLE);
                 }
             }
@@ -93,12 +94,10 @@ public class MainActivity extends Activity {
         serverConnected = false;
         Log.i(TAG, "Discovering OpenDisplay server…");
 
-        // If no image yet, show status immediately. If we have an image,
-        // only show status after 5 minutes of no server.
         if (!hasImage) {
             showStatus("Discovering OpenDisplay server…");
         } else {
-            scheduleNoServerStatus();
+            scheduleNoServerIcon();
         }
 
         discovery = new MdnsDiscovery(this, new MdnsDiscovery.Listener() {
@@ -118,6 +117,7 @@ public class MainActivity extends Activity {
 
     private void connectToServer(final String host, final int port) {
         cancelNoServerTimer();
+        hideDisconnectIcon();
         Log.i(TAG, "Connecting to " + host + ":" + port);
 
         if (!hasImage) {
@@ -129,6 +129,12 @@ public class MainActivity extends Activity {
             public void onConnected(String h, int p) {
                 serverConnected = true;
                 cancelNoServerTimer();
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        hideDisconnectIcon();
+                    }
+                });
                 Log.i(TAG, "Connected to " + h + ":" + p);
             }
 
@@ -188,6 +194,7 @@ public class MainActivity extends Activity {
             imageDisplay.setImageBitmap(bmp);
             hasImage = true;
             statusText.setVisibility(View.GONE);
+            hideDisconnectIcon();
         } else {
             Log.w(TAG, "Failed to decode image (" + imageData.length + " bytes)");
         }
@@ -198,24 +205,32 @@ public class MainActivity extends Activity {
         statusText.setVisibility(View.VISIBLE);
     }
 
-    /** After 5 minutes without a server, show status over the existing image. */
-    private void scheduleNoServerStatus() {
+    private void showDisconnectIcon() {
+        disconnectIcon.setVisibility(View.VISIBLE);
+    }
+
+    private void hideDisconnectIcon() {
+        disconnectIcon.setVisibility(View.GONE);
+    }
+
+    /** After 5 minutes without a server, show disconnect icon. */
+    private void scheduleNoServerIcon() {
         cancelNoServerTimer();
-        noServerStatusRunnable = new Runnable() {
+        noServerRunnable = new Runnable() {
             @Override
             public void run() {
                 if (!serverConnected && hasImage) {
-                    showStatus("No server found");
+                    showDisconnectIcon();
                 }
             }
         };
-        mainHandler.postDelayed(noServerStatusRunnable, NO_SERVER_STATUS_DELAY_MS);
+        mainHandler.postDelayed(noServerRunnable, NO_SERVER_ICON_DELAY_MS);
     }
 
     private void cancelNoServerTimer() {
-        if (noServerStatusRunnable != null) {
-            mainHandler.removeCallbacks(noServerStatusRunnable);
-            noServerStatusRunnable = null;
+        if (noServerRunnable != null) {
+            mainHandler.removeCallbacks(noServerRunnable);
+            noServerRunnable = null;
         }
     }
 
