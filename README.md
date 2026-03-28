@@ -4,6 +4,8 @@ Android app that implements the [OpenDisplay](https://opendisplay.org/) WiFi pro
 
 Built for the **AValue EPD-42S** (42" e-ink display running Android 5.1), but works on any Android 5.0+ device.
 
+> **Note:** OpenDisplay over WiFi is still under development. This app currently only works with the experimental WiFi server in [py-opendisplay (wifi-server branch)](https://github.com/balloob/py-opendisplay/tree/wifi-server).
+
 ## How it works
 
 1. App discovers OpenDisplay servers on the local network via mDNS (`_opendisplay._tcp`)
