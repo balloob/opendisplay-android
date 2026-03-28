@@ -3,6 +3,10 @@ apply plugin: 'com.android.application'
 android {
     compileSdkVersion 28
 
+    lint {
+        disable 'ExpiredTargetSdkVersion'
+    }
+
     defaultConfig {
         applicationId "org.opendisplay.android"
         minSdkVersion 22
