@@ -21,10 +21,6 @@ import org.opendisplay.ImageDecoder;
 import org.opendisplay.OpenDisplayClient;
 import org.opendisplay.OpenDisplayProtocol;
 
-import java.net.InetAddress;
-import java.util.LinkedHashMap;
-import java.util.Map;
-
 public class MainActivity extends Activity {
 
     private static final String TAG = "MainActivity";
@@ -32,8 +28,6 @@ public class MainActivity extends Activity {
     private static final long WHITE_FLASH_MS = 500;
     private static final long RECONNECT_DELAY_MS = 2000;
     private static final long DISCOVERY_RETRY_DELAY_MS = 5000;
-
-    private enum State { DISCOVERING, CONNECTING, CONNECTED, DISCONNECTED }
 
     private ImageView imageDisplay;
     private TextView statusText;
@@ -44,14 +38,11 @@ public class MainActivity extends Activity {
     private MdnsDiscovery discovery;
     private OpenDisplayClient client;
     private int connectionGen;
+    private String activeServerName;
+    private boolean hasImage = false;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private WifiManager.MulticastLock multicastLock;
-
-    private final Map<String, ServerEndpoint> servers = new LinkedHashMap<>();
-    private State state = State.DISCOVERING;
-    private String activeServiceName;
-    private boolean hasImage = false;
     private Runnable noServerRunnable;
     private Runnable reconnectRunnable;
 
@@ -63,7 +54,6 @@ public class MainActivity extends Activity {
         imageDisplay = (ImageView) findViewById(R.id.image_display);
         statusText = (TextView) findViewById(R.id.status_text);
         disconnectIcon = (ImageView) findViewById(R.id.disconnect_icon);
-
         hideSystemUI();
 
         imageDisplay.setOnClickListener(new View.OnClickListener() {
@@ -78,23 +68,13 @@ public class MainActivity extends Activity {
         });
 
         displayConfig = buildDisplayConfig();
-
-        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpenDisplay:poll");
-        wakeLock.acquire();
-
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL, "OpenDisplay:wifi");
-        wifiLock.acquire();
-
-        multicastLock = wm.createMulticastLock("OpenDisplay:mdns");
-        multicastLock.acquire();
+        acquireLocks();
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         discovery = new MdnsDiscovery(this, discoveryListener);
         discovery.start();
-        enterState(State.DISCOVERING);
+        showWaiting();
     }
 
     @Override
@@ -103,45 +83,22 @@ public class MainActivity extends Activity {
         cancelNoServerTimer();
         stopClient();
         discovery.stop();
-        if (wakeLock.isHeld()) wakeLock.release();
-        if (wifiLock.isHeld()) wifiLock.release();
-        if (multicastLock.isHeld()) multicastLock.release();
+        releaseLocks();
         super.onDestroy();
     }
 
-    // -- State machine --
-
-    private void enterState(State newState) {
-        state = newState;
-        Log.i(TAG, "State → " + newState);
-
-        switch (newState) {
-            case DISCOVERING:
-            case DISCONNECTED:
-                if (!hasImage) {
-                    showStatus("Discovering OpenDisplay server\u2026");
-                } else {
-                    scheduleNoServerIcon();
-                }
-                break;
-
-            case CONNECTING:
-            case CONNECTED:
-                cancelNoServerTimer();
-                hideDisconnectIcon();
-                break;
-        }
-    }
-
-    // -- Discovery callbacks (may arrive on NSD threads) --
+    // -- Discovery --
 
     private final MdnsDiscovery.Listener discoveryListener = new MdnsDiscovery.Listener() {
         @Override
-        public void onServerFound(final String name, final InetAddress host, final int port) {
+        public void onServerFound(final MdnsDiscovery.ServerInfo server) {
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    handleServerFound(name, host.getHostAddress(), port);
+                    Log.i(TAG, "Server: " + server.name + " at " + server.host + ":" + server.port);
+                    if (client == null) {
+                        connectTo(server);
+                    }
                 }
             });
         }
@@ -151,7 +108,13 @@ public class MainActivity extends Activity {
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    handleServerLost(name);
+                    Log.i(TAG, "Server gone: " + name);
+                    if (!name.equals(activeServerName)) return;
+                    if (client != null) {
+                        Log.i(TAG, "Active server left mDNS, keeping TCP connection");
+                        return;
+                    }
+                    tryConnect();
                 }
             });
         }
@@ -161,7 +124,7 @@ public class MainActivity extends Activity {
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    Log.e(TAG, "Discovery start failed: " + errorCode + ", retrying");
+                    Log.e(TAG, "Discovery failed: " + errorCode + ", retrying");
                     handler.postDelayed(new Runnable() {
                         @Override
                         public void run() {
@@ -173,58 +136,32 @@ public class MainActivity extends Activity {
         }
     };
 
-    private void handleServerFound(String name, String host, int port) {
-        servers.put(name, new ServerEndpoint(host, port));
-        Log.i(TAG, "Server: " + name + " at " + host + ":" + port);
-
-        if (state == State.DISCOVERING || state == State.DISCONNECTED) {
-            connectToServer(name);
-        }
-    }
-
-    private void handleServerLost(String name) {
-        servers.remove(name);
-        Log.i(TAG, "Server gone: " + name);
-
-        if (!name.equals(activeServiceName)) return;
-
-        if (state == State.CONNECTED || state == State.CONNECTING) {
-            Log.i(TAG, "Active server left mDNS, keeping TCP connection");
-            return;
-        }
-
-        activeServiceName = null;
-        if (!connectToNextServer()) {
-            enterState(State.DISCOVERING);
-        }
-    }
-
     // -- Connection --
 
-    private boolean connectToNextServer() {
-        for (Map.Entry<String, ServerEndpoint> entry : servers.entrySet()) {
-            connectToServer(entry.getKey());
-            return true;
+    private void tryConnect() {
+        MdnsDiscovery.ServerInfo server = discovery.pickServer(activeServerName);
+        activeServerName = null;
+        if (server != null) {
+            connectTo(server);
+        } else {
+            showWaiting();
         }
-        return false;
     }
 
-    private void connectToServer(String name) {
+    private void connectTo(MdnsDiscovery.ServerInfo server) {
         cancelScheduledReconnect();
         stopClient();
 
-        ServerEndpoint ep = servers.get(name);
-        if (ep == null) return;
-
-        activeServiceName = name;
+        activeServerName = server.name;
         final int gen = ++connectionGen;
-        enterState(State.CONNECTING);
 
         if (!hasImage) {
-            showStatus("Connecting to " + ep.host + ":" + ep.port);
+            showStatus("Connecting to " + server.host + ":" + server.port);
         }
+        cancelNoServerTimer();
+        hideDisconnectIcon();
 
-        Log.i(TAG, "Connecting to " + ep.host + ":" + ep.port);
+        Log.i(TAG, "Connecting to " + server.host + ":" + server.port);
 
         final OpenDisplayClient newClient = new OpenDisplayClient(
             displayConfig, new OpenDisplayClient.Listener() {
@@ -235,7 +172,8 @@ public class MainActivity extends Activity {
                         public void run() {
                             if (gen != connectionGen) return;
                             Log.i(TAG, "Connected to " + h + ":" + p);
-                            enterState(State.CONNECTED);
+                            cancelNoServerTimer();
+                            hideDisconnectIcon();
                         }
                     });
                 }
@@ -248,10 +186,16 @@ public class MainActivity extends Activity {
                             if (gen != connectionGen) return;
                             Log.i(TAG, "Disconnected: " + reason);
                             client = null;
-                            activeServiceName = null;
 
-                            if (!connectToNextServer()) {
-                                enterState(State.DISCONNECTED);
+                            // Try a different server immediately, or retry after a delay.
+                            MdnsDiscovery.ServerInfo next =
+                                discovery.pickServer(activeServerName);
+                            activeServerName = null;
+
+                            if (next != null) {
+                                connectTo(next);
+                            } else {
+                                showWaiting();
                                 scheduleReconnect();
                             }
                         }
@@ -294,7 +238,7 @@ public class MainActivity extends Activity {
             Log.w(TAG, "Could not get WiFi RSSI", e);
         }
 
-        newClient.start(ep.host, ep.port);
+        newClient.start(server.host, server.port);
     }
 
     private void stopClient() {
@@ -304,13 +248,10 @@ public class MainActivity extends Activity {
         }
     }
 
-    // -- Reconnect scheduling --
-
     /**
-     * Schedules a single reconnect attempt after a delay. Discovery is still
-     * running — if a new server appears, handleServerFound connects immediately
-     * and cancels this. This handles the case where all known servers are still
-     * in the map but had transient TCP failures.
+     * After a disconnect with no alternative server, retry once after a delay.
+     * Discovery is still running — if a new server appears, onServerFound
+     * connects immediately and this is cancelled.
      */
     private void scheduleReconnect() {
         cancelScheduledReconnect();
@@ -318,8 +259,9 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 reconnectRunnable = null;
-                if (!isFinishing() && state == State.DISCONNECTED) {
-                    connectToNextServer();
+                if (!isFinishing() && client == null) {
+                    MdnsDiscovery.ServerInfo server = discovery.pickServer(null);
+                    if (server != null) connectTo(server);
                 }
             }
         };
@@ -333,7 +275,15 @@ public class MainActivity extends Activity {
         }
     }
 
-    // -- UI helpers --
+    // -- UI --
+
+    private void showWaiting() {
+        if (!hasImage) {
+            showStatus("Discovering OpenDisplay server\u2026");
+        } else {
+            scheduleNoServerIcon();
+        }
+    }
 
     private void renderImage(byte[] imageData) {
         int[] pixels = ImageDecoder.decode(
@@ -378,7 +328,7 @@ public class MainActivity extends Activity {
         noServerRunnable = new Runnable() {
             @Override
             public void run() {
-                if (state != State.CONNECTED && hasImage) {
+                if (client == null && hasImage) {
                     disconnectIcon.setVisibility(View.VISIBLE);
                 }
             }
@@ -393,15 +343,25 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void hideSystemUI() {
-        getWindow().getDecorView().setSystemUiVisibility(
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_FULLSCREEN
-            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-        );
+    // -- Setup --
+
+    private void acquireLocks() {
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpenDisplay:poll");
+        wakeLock.acquire();
+
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL, "OpenDisplay:wifi");
+        wifiLock.acquire();
+
+        multicastLock = wm.createMulticastLock("OpenDisplay:mdns");
+        multicastLock.acquire();
+    }
+
+    private void releaseLocks() {
+        if (wakeLock.isHeld()) wakeLock.release();
+        if (wifiLock.isHeld()) wifiLock.release();
+        if (multicastLock.isHeld()) multicastLock.release();
     }
 
     private DisplayConfig buildDisplayConfig() {
@@ -416,19 +376,20 @@ public class MainActivity extends Activity {
         return cfg;
     }
 
+    private void hideSystemUI() {
+        getWindow().getDecorView().setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        );
+    }
+
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) hideSystemUI();
-    }
-
-    private static class ServerEndpoint {
-        final String host;
-        final int port;
-
-        ServerEndpoint(String host, int port) {
-            this.host = host;
-            this.port = port;
-        }
     }
 }

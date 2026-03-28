@@ -11,10 +11,13 @@ import org.opendisplay.OpenDisplayProtocol;
 
 import java.net.InetAddress;
 import java.util.ArrayDeque;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Queue;
 
 /**
- * Discovers OpenDisplay servers on the local network via mDNS.
+ * Discovers OpenDisplay servers on the local network via mDNS and maintains
+ * the set of known servers.
  *
  * Handles the Android NsdManager quirk where only one resolveService() call
  * can be active at a time by queuing resolve requests and processing them
@@ -26,8 +29,20 @@ public class MdnsDiscovery {
     private static final int MAX_RESOLVE_RETRIES = 3;
     private static final long RESOLVE_RETRY_DELAY_MS = 500;
 
+    public static class ServerInfo {
+        public final String name;
+        public final String host;
+        public final int port;
+
+        ServerInfo(String name, String host, int port) {
+            this.name = name;
+            this.host = host;
+            this.port = port;
+        }
+    }
+
     public interface Listener {
-        void onServerFound(String serviceName, InetAddress host, int port);
+        void onServerFound(ServerInfo server);
         void onServerLost(String serviceName);
         void onDiscoveryStartFailed(int errorCode);
     }
@@ -39,6 +54,7 @@ public class MdnsDiscovery {
     private NsdManager.DiscoveryListener discoveryListener;
     private boolean discovering = false;
 
+    private final Map<String, ServerInfo> servers = new LinkedHashMap<>();
     private final Queue<NsdServiceInfo> resolveQueue = new ArrayDeque<>();
     private boolean resolving = false;
     private int resolveRetryCount = 0;
@@ -66,8 +82,12 @@ public class MdnsDiscovery {
 
             @Override
             public void onServiceLost(NsdServiceInfo serviceInfo) {
-                Log.i(TAG, "Lost: " + serviceInfo.getServiceName());
-                listener.onServerLost(serviceInfo.getServiceName());
+                String name = serviceInfo.getServiceName();
+                Log.i(TAG, "Lost: " + name);
+                synchronized (MdnsDiscovery.this) {
+                    servers.remove(name);
+                }
+                listener.onServerLost(name);
             }
 
             @Override
@@ -102,6 +122,7 @@ public class MdnsDiscovery {
         discovering = false;
         resolveQueue.clear();
         resolving = false;
+        servers.clear();
         try {
             nsdManager.stopServiceDiscovery(discoveryListener);
         } catch (IllegalArgumentException e) {
@@ -109,8 +130,14 @@ public class MdnsDiscovery {
         }
     }
 
-    public synchronized boolean isDiscovering() {
-        return discovering;
+    /** Returns any known server, preferring one that isn't {@code exclude}. */
+    public synchronized ServerInfo pickServer(String exclude) {
+        ServerInfo fallback = null;
+        for (ServerInfo info : servers.values()) {
+            if (!info.name.equals(exclude)) return info;
+            fallback = info;
+        }
+        return fallback;
     }
 
     private synchronized void enqueueResolve(NsdServiceInfo serviceInfo) {
@@ -169,13 +196,16 @@ public class MdnsDiscovery {
                     }
                 }
 
-                Log.i(TAG, "Resolved: " + resolved.getServiceName()
-                    + " → " + host.getHostAddress() + ":" + port);
-                listener.onServerFound(resolved.getServiceName(), host, port);
+                String name = resolved.getServiceName();
+                String hostStr = host.getHostAddress();
+                Log.i(TAG, "Resolved: " + name + " \u2192 " + hostStr + ":" + port);
 
+                ServerInfo info = new ServerInfo(name, hostStr, port);
                 synchronized (MdnsDiscovery.this) {
+                    servers.put(name, info);
                     resolveNext();
                 }
+                listener.onServerFound(info);
             }
         });
     }
