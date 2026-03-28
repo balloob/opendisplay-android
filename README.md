@@ -59,6 +59,7 @@ The Java library has unit tests and integration tests that automatically start a
 ```
 
 Requires `uv` and Python 3.11+ for the integration tests.
+If `py-opendisplay` is checked out somewhere else, set `PY_OPENDISPLAY_DIR=/path/to/py-opendisplay`.
 
 ## Server
 

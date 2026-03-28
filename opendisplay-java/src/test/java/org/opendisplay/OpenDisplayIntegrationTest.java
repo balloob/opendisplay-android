@@ -28,9 +28,11 @@ public class OpenDisplayIntegrationTest {
 
     @Before
     public void startServer() throws Exception {
-        File projectRoot = findProjectRoot();
-        File pyDir = new File(projectRoot, "py-opendisplay");
-        assertTrue("py-opendisplay directory must exist", pyDir.isDirectory());
+        File pyDir = findPyOpenDisplayDir();
+        assertTrue(
+            "py-opendisplay directory must exist (set PY_OPENDISPLAY_DIR or pyOpenDisplayDir to override): "
+                + pyDir.getAbsolutePath(),
+            pyDir.isDirectory());
 
         ProcessBuilder pb = new ProcessBuilder(
             "uv", "run", "opendisplay-serve",
@@ -168,5 +170,18 @@ public class OpenDisplayIntegrationTest {
             dir = dir.getParentFile();
         }
         return new File(System.getProperty("user.dir")).getParentFile();
+    }
+
+    private File findPyOpenDisplayDir() {
+        String configuredDir = System.getenv("PY_OPENDISPLAY_DIR");
+        if (configuredDir == null || configuredDir.trim().length() == 0) {
+            configuredDir = System.getProperty("pyOpenDisplayDir");
+        }
+        if (configuredDir != null && configuredDir.trim().length() > 0) {
+            return new File(configuredDir.trim());
+        }
+
+        File projectRoot = findProjectRoot();
+        return new File(projectRoot, "py-opendisplay");
     }
 }
