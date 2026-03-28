@@ -109,12 +109,6 @@ public class MainActivity extends Activity {
                 @Override
                 public void run() {
                     Log.i(TAG, "Server gone: " + name);
-                    if (!name.equals(activeServerName)) return;
-                    if (client != null) {
-                        Log.i(TAG, "Active server left mDNS, keeping TCP connection");
-                        return;
-                    }
-                    tryConnect();
                 }
             });
         }
@@ -137,16 +131,6 @@ public class MainActivity extends Activity {
     };
 
     // -- Connection --
-
-    private void tryConnect() {
-        MdnsDiscovery.ServerInfo server = discovery.pickServer(activeServerName);
-        activeServerName = null;
-        if (server != null) {
-            connectTo(server);
-        } else {
-            showWaiting();
-        }
-    }
 
     private void connectTo(MdnsDiscovery.ServerInfo server) {
         cancelScheduledReconnect();
