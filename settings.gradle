@@ -1,0 +1,3 @@
+rootProject.name = 'OpenDisplay'
+include ':opendisplay-java'
+include ':app'

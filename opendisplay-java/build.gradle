@@ -1,0 +1,18 @@
+apply plugin: 'java-library'
+
+sourceCompatibility = JavaVersion.VERSION_1_7
+targetCompatibility = JavaVersion.VERSION_1_7
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
+
+test {
+    // Integration tests need the py-opendisplay server running.
+    // Use: ./gradlew :opendisplay-java:test
+    // The test starts/stops the Python server automatically.
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+}
