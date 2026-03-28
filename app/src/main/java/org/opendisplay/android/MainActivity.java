@@ -166,8 +166,15 @@ public class MainActivity extends Activity {
             return;
         }
 
+        if (client != null || connectionPending) {
+            Log.i(
+                TAG,
+                "Active server disappeared from mDNS, keeping current TCP connection until it closes"
+            );
+            return;
+        }
+
         Log.i(TAG, "Current server disappeared, looking for another OpenDisplay server");
-        stopClient();
         clearActiveServer();
 
         if (!connectToAvailableServer()) {
