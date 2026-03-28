@@ -18,7 +18,8 @@ public class MdnsDiscovery {
     private static final String TAG = "MdnsDiscovery";
 
     public interface Listener {
-        void onServerFound(InetAddress host, int port);
+        void onServerFound(String serviceName, InetAddress host, int port);
+        void onServerLost(String serviceName);
         void onDiscoveryError(String message);
     }
 
@@ -50,6 +51,7 @@ public class MdnsDiscovery {
             @Override
             public void onServiceLost(NsdServiceInfo serviceInfo) {
                 Log.i(TAG, "Service lost: " + serviceInfo.getServiceName());
+                listener.onServerLost(serviceInfo.getServiceName());
             }
 
             @Override
@@ -115,7 +117,7 @@ public class MdnsDiscovery {
                 }
 
                 Log.i(TAG, "Resolved: " + host + ":" + port);
-                listener.onServerFound(host, port);
+                listener.onServerFound(serviceInfo.getServiceName(), host, port);
             }
         });
     }
