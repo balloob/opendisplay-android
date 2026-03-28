@@ -26,10 +26,10 @@ import java.net.InetAddress;
 public class MainActivity extends Activity {
 
     private static final String TAG = "MainActivity";
+    private static final long NO_SERVER_STATUS_DELAY_MS = 5 * 60 * 1000;
 
     private ImageView imageDisplay;
     private TextView statusText;
-    private boolean statusVisible = true;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private DisplayConfig displayConfig;
@@ -37,6 +37,10 @@ public class MainActivity extends Activity {
     private MdnsDiscovery discovery;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
+
+    private boolean hasImage = false;
+    private boolean serverConnected = false;
+    private Runnable noServerStatusRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -48,17 +52,20 @@ public class MainActivity extends Activity {
 
         hideSystemUI();
 
+        // Tap to toggle status overlay
         imageDisplay.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                statusVisible = !statusVisible;
-                statusText.setVisibility(statusVisible ? View.VISIBLE : View.GONE);
+                if (statusText.getVisibility() == View.VISIBLE) {
+                    statusText.setVisibility(View.GONE);
+                } else {
+                    statusText.setVisibility(View.VISIBLE);
+                }
             }
         });
 
         displayConfig = buildDisplayConfig();
 
-        // Keep CPU and WiFi active
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpenDisplay:poll");
         wakeLock.acquire();
@@ -75,6 +82,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        cancelNoServerTimer();
         if (client != null) client.stop();
         if (discovery != null) discovery.stop();
         if (wakeLock.isHeld()) wakeLock.release();
@@ -82,7 +90,16 @@ public class MainActivity extends Activity {
     }
 
     private void startDiscovery() {
-        setStatus("Discovering OpenDisplay server…");
+        serverConnected = false;
+        Log.i(TAG, "Discovering OpenDisplay server…");
+
+        // If no image yet, show status immediately. If we have an image,
+        // only show status after 5 minutes of no server.
+        if (!hasImage) {
+            showStatus("Discovering OpenDisplay server…");
+        } else {
+            scheduleNoServerStatus();
+        }
 
         discovery = new MdnsDiscovery(this, new MdnsDiscovery.Listener() {
             @Override
@@ -93,25 +110,32 @@ public class MainActivity extends Activity {
 
             @Override
             public void onDiscoveryError(String message) {
-                setStatus("Discovery error: " + message);
+                Log.e(TAG, "Discovery error: " + message);
             }
         });
         discovery.start();
     }
 
     private void connectToServer(final String host, final int port) {
-        setStatus("Connecting to " + host + ":" + port);
+        cancelNoServerTimer();
+        Log.i(TAG, "Connecting to " + host + ":" + port);
+
+        if (!hasImage) {
+            showStatus("Connecting to " + host + ":" + port);
+        }
 
         client = new OpenDisplayClient(displayConfig, new OpenDisplayClient.Listener() {
             @Override
             public void onConnected(String h, int p) {
-                setStatus("Connected to " + h + ":" + p);
+                serverConnected = true;
+                cancelNoServerTimer();
+                Log.i(TAG, "Connected to " + h + ":" + p);
             }
 
             @Override
             public void onDisconnected(String reason) {
+                serverConnected = false;
                 Log.i(TAG, "Disconnected: " + reason);
-                // Restart discovery
                 mainHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
@@ -132,16 +156,15 @@ public class MainActivity extends Activity {
 
             @Override
             public void onNoImage(long pollInterval) {
-                setStatus("No image, polling in " + pollInterval + "s");
+                Log.i(TAG, "No new image, polling in " + pollInterval + "s");
             }
 
             @Override
             public void onError(String message) {
-                setStatus("Error: " + message);
+                Log.e(TAG, "Error: " + message);
             }
         });
 
-        // Pass WiFi RSSI to the library client
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
             WifiInfo info = wm.getConnectionInfo();
@@ -163,28 +186,37 @@ public class MainActivity extends Activity {
             Bitmap bmp = Bitmap.createBitmap(
                 pixels, displayConfig.width, displayConfig.height, Bitmap.Config.ARGB_8888);
             imageDisplay.setImageBitmap(bmp);
-            statusVisible = false;
+            hasImage = true;
             statusText.setVisibility(View.GONE);
         } else {
             Log.w(TAG, "Failed to decode image (" + imageData.length + " bytes)");
-            statusText.setText("Failed to decode image");
-            statusText.setVisibility(View.VISIBLE);
-            statusVisible = true;
         }
     }
 
-    private void setStatus(final String text) {
-        mainHandler.post(new Runnable() {
+    private void showStatus(String text) {
+        statusText.setText(text);
+        statusText.setVisibility(View.VISIBLE);
+    }
+
+    /** After 5 minutes without a server, show status over the existing image. */
+    private void scheduleNoServerStatus() {
+        cancelNoServerTimer();
+        noServerStatusRunnable = new Runnable() {
             @Override
             public void run() {
-                Log.i(TAG, text);
-                statusText.setText(text);
-                if (!statusVisible) {
-                    statusText.setVisibility(View.VISIBLE);
-                    statusVisible = true;
+                if (!serverConnected && hasImage) {
+                    showStatus("No server found");
                 }
             }
-        });
+        };
+        mainHandler.postDelayed(noServerStatusRunnable, NO_SERVER_STATUS_DELAY_MS);
+    }
+
+    private void cancelNoServerTimer() {
+        if (noServerStatusRunnable != null) {
+            mainHandler.removeCallbacks(noServerStatusRunnable);
+            noServerStatusRunnable = null;
+        }
     }
 
     private void hideSystemUI() {
@@ -198,11 +230,6 @@ public class MainActivity extends Activity {
         );
     }
 
-    /**
-     * Auto-detect display size from the real screen resolution.
-     * Color scheme is monochrome since that's the only option the
-     * OpenDisplay protocol has that maps to a grayscale e-ink panel.
-     */
     private DisplayConfig buildDisplayConfig() {
         DisplayConfig cfg = new DisplayConfig();
 
@@ -210,7 +237,6 @@ public class MainActivity extends Activity {
         Point size = new Point();
         display.getRealSize(size);
 
-        // Use the larger dimension as width (landscape)
         cfg.width = Math.max(size.x, size.y);
         cfg.height = Math.min(size.x, size.y);
         cfg.colorScheme = OpenDisplayProtocol.COLOR_MONOCHROME;
