@@ -7,8 +7,8 @@ android {
         applicationId "org.opendisplay.android"
         minSdkVersion 22
         targetSdkVersion 28
-        versionCode 1
-        versionName "1.0"
+        versionCode project.hasProperty('buildVersionCode') ? project.buildVersionCode.toInteger() : 1
+        versionName project.hasProperty('buildVersionName') ? project.buildVersionName : "dev"
     }
 
     buildTypes {
