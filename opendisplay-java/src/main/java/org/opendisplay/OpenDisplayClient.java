@@ -22,7 +22,7 @@ public class OpenDisplayClient {
     private static final Logger LOG = Logger.getLogger(OpenDisplayClient.class.getName());
 
     private static final int CONNECT_TIMEOUT_MS = 10000;
-    private static final int READ_TIMEOUT_MS = 30000;
+    private static final int READ_TIMEOUT_MS = 60000;
     private static final int MAX_FRAME_SIZE = 1024 * 1024;
 
     public interface Listener {
